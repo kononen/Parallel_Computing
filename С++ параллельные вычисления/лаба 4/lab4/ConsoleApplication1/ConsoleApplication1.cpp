@@ -1,0 +1,282 @@
+﻿#include <iostream>
+#include <fstream>
+#include <vector>
+#include <cmath>
+#include <string>
+#include <iomanip>
+#include <random>
+#include "mpi.h"
+#include "math.h"
+
+#define _USE_MATH_DEFINES
+
+
+const double G = 6.67 * 1e-11;
+const double eps = 1e-3;
+
+
+const bool f1 = true; //чтение с файла(true) или рандом(false)
+const bool f2 = true; //запись траекторий(true), не записывать(false)
+
+struct body 
+{
+	double m; //масса  	
+	double r[3]; //координаты 
+	double v[3]; //скорости
+
+};
+
+
+
+
+std::ostream& operator<<(std::ostream& str, const body& b) //перегрузка вывода
+{
+	str << std::setprecision(10) << b.r[0] << " " << b.r[1] << " " << b.r[2] << std::endl; 
+
+	return str;
+}
+
+inline double norm_vect(const double* r) //норма вектора
+{
+	return sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+}
+
+inline double max(double a, double b)
+{
+	return ((a) > (b)) ? (a) : (b);
+}
+
+inline double cube(double a)
+{
+	return a * a * a;
+}
+
+
+void a_calc(std::vector<double>& a, const size_t N, const std::vector<body>& Body_global, const double* r) {
+
+	for (size_t k = 0; k < 3; ++k)
+		a[k] = 0.0;
+
+	double diff_r[3] = { 0.0, 0.0, 0.0 };
+	double coeff;
+
+	for (size_t j = 0; j < N; ++j)
+	{
+		for (size_t k = 0; k < 3; ++k)
+			diff_r[k] = r[k] - Body_global[j].r[k];
+
+		coeff = cube(1.0 / max(norm_vect(diff_r), eps));
+
+		for (size_t k = 0; k < 3; ++k)
+			a[k] -= coeff * G * Body_global[j].m * diff_r[k];
+	}
+
+}
+
+
+void runge_kutta(const size_t N, std::vector<body>& Body_global, std::vector<body>& local_body, const int Nt, const double tau, const double tau_f,
+	const std::vector<int>& len, const std::vector<int>& disp, int n_p, int rank, MPI_Datatype MPI_BODY, MPI_Datatype MPI_BODY_R) {
+
+	int n_local = len[rank];
+	std::vector<body> local_body_buf(local_body);
+
+	std::vector<double> a = { 0.0, 0.0, 0.0 }; 
+	std::vector<double> a_array(3 * n_local);
+
+	int n_f = round(tau_f / tau); //число итераций через которые происходит запись в файл
+	std::vector<std::ofstream> F;
+	if (f2)
+	{
+		F.resize(n_local); 
+
+		for (size_t i = 0; i < n_local; ++i)
+		{
+			F[i].open("traj" + std::to_string(disp[rank] + i + 1) + ".txt");
+			F[i] << 0.0 << " " << local_body[i] << std::endl;
+		}
+	}
+
+
+	for (size_t m = 1; m <= Nt; ++m) {
+
+		for (size_t i = 0; i < n_local; ++i) {
+
+			local_body_buf[i] = local_body[i]; 
+
+			a_calc(a, N, Body_global, local_body[i].r);
+
+			for (size_t k = 0; k < 3; ++k) {
+				(local_body_buf[i].r)[k] += local_body[i].v[k] * tau;
+				(local_body_buf[i].v)[k] += a[k] * tau;
+				
+				a_array[3 * i + k] = a[k];
+			}
+		}
+
+		MPI_Allgatherv(local_body_buf.data(), len[rank], MPI_BODY_R, Body_global.data(), len.data(), disp.data(), MPI_BODY_R, MPI_COMM_WORLD);
+
+		for (size_t i = 0; i < n_local; ++i) {
+
+			a_calc(a, N, Body_global, local_body_buf[i].r);
+			
+			for (size_t k = 0; k < 3; ++k) {
+				local_body[i].r[k] += (local_body_buf[i].v[k] + local_body[i].v[k]) * tau / 2;
+				local_body[i].v[k] += (a_array[i * 3 + k] + a[k]) * tau / 2;
+			}
+		}
+
+		MPI_Allgatherv(local_body.data(), len[rank], MPI_BODY_R, Body_global.data(), len.data(), disp.data(), MPI_BODY_R, MPI_COMM_WORLD);
+
+
+		if (f2 and (m % n_f) == 0)
+			for (size_t i = 0; i < n_local; ++i)
+				F[i] << tau * m << " " << local_body[i];
+	}
+
+	if (f2)
+		for (size_t i = 0; i < n_local; ++i)
+			F[i].close();
+}
+
+void read_file(const std::string& file_name, std::vector<body>& Body, int& N)
+{
+	std::ifstream f(file_name);
+
+	f >> N;
+	Body.resize(N);
+	for (int i = 0; i < N; i++)
+	{
+		f >> Body[i].m;
+		for (int k = 0; k < 3; k++) f >> Body[i].r[k];
+		for (int k = 0; k < 3; k++) f >> Body[i].v[k];
+	}
+	f.close();
+}
+
+double rand_R(double a, double b) {
+
+	srand(time(NULL));
+	return (double)((b - a) * rand()) / RAND_MAX + a;
+}
+
+void random_body(std::vector<body>& Body, const int N) {
+
+	Body.resize(N);
+	for (size_t i = 0; i < N; ++i) {
+
+		Body[i].m = rand_R(1e5, 1e8);
+
+		for (size_t k = 0; k < 3; ++k) {
+			Body[i].r[k] = rand_R(-1e4, 1e4);
+			Body[i].v[k] = rand_R(-200, 200);
+		}
+	}
+
+}
+
+int main(int argc, char** argv)
+{
+	int rank; 
+	int n_p;  
+	int N = 4; //количество тел
+	double T = 20; //время
+	int Nt = 1600; //количество разбиений по времени
+
+	double tau = T / Nt; //шаг по времени
+	double tau_f = 0.1; //шаг записи в файл (по времени)
+
+
+	MPI_Init(&argc, &argv);
+
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &n_p);
+
+
+	std::vector<int> len(n_p);	//размерности локальных массивов тел (со скольки телами работает каждый процесс) 
+	std::vector<int> displs(n_p); //массив смещений (глобальный индекс первого локального элемента)
+
+
+	// формирование типа  MPI_BODY (для отправки структуры тела целиком)
+	const int n = 3; 
+	int len_struct[3] = { 1, 3, 3 }; 
+	MPI_Datatype types[3] = { MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE }; 
+	MPI_Aint offsets[3] = { offsetof(body, m), offsetof(body, r), offsetof(body, v) }; 
+
+	MPI_Datatype MPI_BODY;
+	MPI_Type_create_struct(n, len_struct, offsets, types, &MPI_BODY);
+	MPI_Type_commit(&MPI_BODY);
+
+
+	// формирование типа  MPI_BODY_R (для отправки координат тела)
+	int n_r = 1;  
+	int len_struct_r[] = { 3 }; 
+	MPI_Aint offsets_r[] = { offsetof(body, r) }; 
+	MPI_Datatype types_r[] = { MPI_DOUBLE }; 
+
+	MPI_Datatype mpi_tmp;
+	MPI_Type_create_struct(n_r, len_struct_r, offsets_r, types_r, &mpi_tmp);
+
+	MPI_Datatype MPI_BODY_R;
+	MPI_Type_create_resized(mpi_tmp, 0, 56, &MPI_BODY_R); 
+
+	MPI_Type_commit(&MPI_BODY_R);
+
+
+
+	std::vector<body> Body_global; //глобальный массив тел
+
+	if (rank == 0) {
+		if (f1)
+			read_file("4body.txt", Body_global, N);
+		else
+			random_body(Body_global, N);
+	}
+
+	MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD); //Рассылка количества тел
+	
+	if (rank != 0) 
+		Body_global.reserve(N);
+
+
+	if (rank == 0) //заполнение массива размеров локальных массивов тел и смещений
+	{
+		int l = N / n_p; 
+
+		for (int i = 0; i < n_p; ++i) len[i] = l;
+		for (int i = 0; i < N % n_p; ++i) ++len[i];
+	
+		displs[0] = 0;
+		for (int i = 1; i < n_p; ++i) displs[i] = displs[i - 1] + len[i - 1];
+	}
+
+	MPI_Bcast(len.data(), n_p, MPI_INT, 0, MPI_COMM_WORLD); //отправка len 
+	MPI_Bcast(displs.data(), n_p, MPI_INT, 0, MPI_COMM_WORLD); //отправка displs 
+
+	std::vector<body> Body_local(len[rank]); 
+
+	MPI_Scatterv(Body_global.data(), len.data(), displs.data(), MPI_BODY, Body_local.data(), len[rank], MPI_BODY, 0, MPI_COMM_WORLD); 
+	
+	MPI_Bcast(Body_global.data(), N, MPI_BODY, 0, MPI_COMM_WORLD); 
+
+
+	double start, finish;
+	double time;
+
+
+	start = MPI_Wtime();
+
+	runge_kutta(N, Body_global, Body_local, Nt, tau, tau_f, len, displs, n_p, rank, MPI_BODY, MPI_BODY_R);
+
+	finish = MPI_Wtime();
+
+	time = (finish - start) / Nt;
+
+	if (rank == 0) {
+		std::cout << "Number of bodies: " << N << std::endl;
+		std::cout << "n_p: " << n_p << std::endl;
+		std::cout << "Time: " << time << std::endl;
+	}
+
+	MPI_Finalize();
+	return 0;
+}

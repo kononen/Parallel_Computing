@@ -1,0 +1,317 @@
+
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <cstring>
+#include <stdio.h> 
+#include <stdlib.h>
+#include <math.h>
+#include <random>
+#include <iomanip>
+#include <omp.h>
+
+#define DATATYPE_DOUBLE
+
+#ifdef DATATYPE_FLOAT
+#define T1  float
+#define T2 float4
+#endif
+
+#ifdef DATATYPE_DOUBLE
+#define T1  double
+#define T2 double4
+#endif
+
+#define CUDA_BLOCK_SIZE 1
+
+#define G 6.67e-11
+#define eps 1e-3
+
+
+#define f1 true
+#define f2 true
+
+
+struct Body // Структура "тело"
+{
+    T1 m;    // Масса
+    T1 r[3]; // Координаты
+    T1 v[3]; // Скорости
+
+    // Перегрузка оператора присваивания
+
+};
+
+// Перегрузка оператора вывода для структуры "тело"
+std::ostream& operator<<(std::ostream& str, const Body& b)
+{
+    str << std::setprecision(12) << b.r[0] << " " << b.r[1] << " " << b.r[2] << std::endl;
+
+    return str;
+}
+
+
+__device__ inline T1 norm1(const T2& r) {
+    return sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+}
+
+
+__device__ inline T1 max1(T1 a, T1 b)
+{
+    return ((a) > (b)) ? (a) : (b);
+}
+
+__device__ inline T1 cube(T1 a)
+{
+    return a * a * a;
+}
+
+
+__device__ inline T2 cuda_get_acceleration(const T2& position_i, const T2& position_j) {
+    // dr = position_j - position_i
+    T2 dr;
+    dr.x = position_i.x - position_j.x;
+    dr.y = position_i.y - position_j.y;
+    dr.z = position_i.z - position_j.z;
+
+    // dr2 = ||dr||^2 + EPS^2
+    const T1 EPSILON = 1e-8;
+    const T1 dr2 = dr.x * dr.x + dr.y * dr.y + dr.z * dr.z + EPSILON;
+
+    // dr3inverse = 1/dr2^(3/2)
+#ifdef DATATYPE_FLOAT
+    const T1 mass_dr3inverse = __fdividef(position_j.w, dr2) * __frsqrt_rn(dr2);
+#endif
+#ifdef DATATYPE_DOUBLE
+    const T1 mass_dr3inverse = __ddiv_rn(position_j.w, dr2) * rsqrt(dr2);
+#endif
+
+    // const T mass_dr3inverse = G * position_j.w / dr2 / sqrt(dr2);
+
+
+    // acceleration = m_j * dr3inverse
+    T2 acceleration;
+    acceleration.x = dr.x * mass_dr3inverse;
+    acceleration.y = dr.y * mass_dr3inverse;
+    acceleration.z = dr.z * mass_dr3inverse;
+
+    return acceleration;
+}
+
+__global__ void runge_kutta_it(Body* bodies, T2* temp_positions, int N, T1 tau) {
+    // 1 thread per body => index corresponds to body
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    T1 halftau = T1(0.5) * tau;
+
+    const int block_size = CUDA_BLOCK_SIZE;
+
+    __shared__ T2 arr[block_size];
+
+    T2 temp_accel, accel;
+    T2 temp_velocity;
+    T2 temp;
+
+
+    T2 bi;
+    bi.x = bodies[i].r[0];
+    bi.y = bodies[i].r[1];
+    bi.z = bodies[i].r[2];
+    bi.w = bodies[i].m;
+
+    // Compute accelerations
+    temp_accel.x = 0;
+    temp_accel.y = 0;
+    temp_accel.z = 0;
+
+    for (int block = 0; block < N / block_size; ++block) {
+
+        const int offset = block * block_size;
+
+        arr[threadIdx.x].x = bodies[offset + threadIdx.x].r[0];
+        arr[threadIdx.x].y = bodies[offset + threadIdx.x].r[1];
+        arr[threadIdx.x].z = bodies[offset + threadIdx.x].r[2];
+        arr[threadIdx.x].w = bodies[offset + threadIdx.x].m;
+
+        __syncthreads();
+
+        for (size_t j = 0; j < block_size; ++j) {
+            temp = cuda_get_acceleration(bi, arr[j]);
+
+            // acceleration
+            temp_accel.x -= temp.x;
+            temp_accel.y -= temp.y;
+            temp_accel.z -= temp.z;
+        }
+
+        __syncthreads();
+    }
+
+    // Set temp positions, velocities
+    temp_positions[i].x = bodies[i].r[0] + bodies[i].v[0] * tau;
+    temp_positions[i].y = bodies[i].r[1] + bodies[i].v[1] * tau;
+    temp_positions[i].z = bodies[i].r[2] + bodies[i].v[2] * tau;
+    temp_positions[i].w = bodies[i].m;
+
+    temp_velocity.x = bodies[i].v[0] + temp_accel.x * tau;
+    temp_velocity.y = bodies[i].v[1] + temp_accel.y * tau;
+    temp_velocity.z = bodies[i].v[2] + temp_accel.z * tau;
+
+    // y_n+1 = y_n + tau * k2
+
+    // Compute accelerations
+    const T2 temp_bi = temp_positions[i];
+
+    accel.x = 0;
+    accel.y = 0;
+    accel.z = 0;
+
+    for (int block = 0; block < N / block_size; ++block) {
+
+        const int offset = block * block_size;
+
+        arr[threadIdx.x] = temp_positions[offset + threadIdx.x];
+
+        __syncthreads();
+
+        for (size_t j = 0; j < block_size; ++j) {
+            temp = cuda_get_acceleration(temp_bi, arr[j]);
+
+            // acceleration
+            accel.x -= temp.x;
+            accel.y -= temp.y;
+            accel.z -= temp.z;
+        }
+
+        __syncthreads();
+    }
+
+    // Set positions, velocities
+    bodies[i].r[0] += (bodies[i].v[0] + temp_velocity.x) * halftau;
+    bodies[i].r[1] += (bodies[i].v[1] + temp_velocity.y) * halftau;
+    bodies[i].r[2] += (bodies[i].v[2] + temp_velocity.z) * halftau;
+
+    bodies[i].v[0] += (accel.x + temp_accel.x) * halftau;
+    bodies[i].v[1] += (accel.y + temp_accel.y) * halftau;
+    bodies[i].v[2] += (accel.z + temp_accel.z) * halftau;
+}
+
+void runge_kutta(const int N, std::vector<Body> bodies, const int iterations, const double tau, const double tau_f) {
+
+    Body* device_bodies_ptr;
+    T2* temp_positions_ptr;
+
+    cudaError_t err;
+
+    err = cudaMalloc(&device_bodies_ptr, N * sizeof(Body));
+    if (err != cudaSuccess) printf("MALLOC ERROR %d %s\n", err, cudaGetErrorString(err));
+
+    err = cudaMemcpy(device_bodies_ptr, bodies.data(), N * sizeof(Body), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) printf("MEMCPY ERROR %d %s\n", err, cudaGetErrorString(err));
+
+    err = cudaMalloc(&temp_positions_ptr, N * sizeof(T2));
+    if (err != cudaSuccess) printf("TEMP MALLOC ERROR %d %s\n", err, cudaGetErrorString(err));
+
+    // Setup blocking
+    const int blocks = N / CUDA_BLOCK_SIZE;
+
+    // ---------------------------
+    // --- Iteration over time ---
+    // ---------------------------
+    std::vector<std::ofstream> F;
+    F.resize(N);
+    for (size_t i = 0; i < N; ++i)
+    {
+        F[i].open("traj" + std::to_string(i + 1) + ".txt");
+        F[i] << 0.0 << " " << bodies[i];
+    }
+
+    for (int step = 0; step < iterations; step++) {
+        // ----------------------
+        // --- Explicit Euler ---
+        // ----------------------
+        runge_kutta_it << <blocks, CUDA_BLOCK_SIZE >> > (device_bodies_ptr, temp_positions_ptr, N, tau);
+        cudaDeviceSynchronize();
+
+
+        cudaMemcpy(bodies.data(), device_bodies_ptr, N * sizeof(Body), cudaMemcpyDeviceToHost);
+        
+
+        for (size_t i = 0; i < N; ++i) {
+            F[i] << step * tau << " " << bodies[i];
+        }
+
+    }
+    for (size_t i = 0; i < N; ++i)
+        F[i].close();
+}
+
+
+
+
+void read_file(const std::string& file_name, std::vector<Body>& Body, int& N)
+{
+    std::ifstream f(file_name);
+
+    f >> N;
+    Body.resize(N);
+    for (int i = 0; i < N; i++) {
+
+        f >> Body[i].m;
+        for (int k = 0; k < 3; k++) f >> Body[i].r[k];
+        for (int k = 0; k < 3; k++) f >> Body[i].v[k];
+
+        std::cout << Body[i].r[0] << " " << Body[i].r[1] << " " << Body[i].r[2] << " " << Body[i].v[0] << " " << Body[i].v[1] << " " << Body[i].v[2] << std::endl;
+    }
+    f.close();
+}
+
+double rand_R(double a, double b) {
+
+    srand(time(NULL));
+    return (double)((b - a) * rand()) / RAND_MAX + a;
+}
+
+void random_body(std::vector<Body>& Body, const int N) {
+
+    Body.resize(N);
+    for (size_t i = 0; i < N; ++i) {
+
+        Body[i].m = rand_R(1e5, 1e8);
+
+        for (size_t k = 0; k < 3; ++k) {
+            Body[i].r[k] = rand_R(-1e4, 1e4);
+            Body[i].v[k] = rand_R(-200, 200);
+        }
+    }
+
+}
+
+
+int main(int argc, char** argv)
+{
+    int N = 4;
+    double T = 20;
+    int Nt = 400;
+
+    double tau = T / Nt;
+    double tau_f = 0.1; //шаг записи в файл
+
+    std::vector<Body> Body_global; // создание локального массива тел
+
+    if (f1)
+        read_file("4body.txt", Body_global, N);
+    //else
+       // random_body(Body_global, N);
+
+    runge_kutta(N, Body_global, Nt, tau, tau_f);
+
+    return 0;
+}
+
+
+

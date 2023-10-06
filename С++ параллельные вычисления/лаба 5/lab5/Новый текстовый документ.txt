@@ -1,0 +1,283 @@
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <cstring>
+#include <stdio.h> 
+#include <stdlib.h>
+#include <math.h>
+#include <random>
+#include <iomanip>
+#include <omp.h>
+
+
+
+#define T1 float
+#define T2 float4
+
+
+const bool f1 = true; //флаг для чтения тел из файла
+const bool f2 = true; //флаг для записи траекторий в текстовый файл
+
+const int  BLOCK_SIZE = 2;
+const float G = 6.67e-11;
+const float eps = 1e-8;
+
+struct Body // Структура "тело"
+{
+    T1 m;    // Масса
+    T1 r[3]; // Координаты
+    T1 v[3]; // Скорости
+
+    // Перегрузка оператора присваивания
+
+};
+
+// Перегрузка оператора вывода для структуры "тело"
+std::ostream& operator<<(std::ostream& str, const Body& b)
+{
+    str << std::setprecision(10) << b.r[0] << " " << b.r[1] << " " << b.r[2] << std::endl;
+
+    return str;
+}
+
+
+__device__ inline T1 norm1(const T2& r) {
+    return sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+}
+
+
+__device__ inline T1 max1(T1 a, T1 b)
+{
+    return ((a) > (b)) ? (a) : (b);
+}
+
+
+
+__global__ void runge_kutta_it(Body* body_global, T2* body_global_temp, int N, T1 tau, int Nt) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const int block_size = BLOCK_SIZE;
+
+    __shared__ T2 body_shared[block_size]; 
+
+    T2 a_temp;
+    T2 a;
+    T2 v_temp;
+    T2 body_i;
+
+  
+    T1 coeff;
+    T2 diff_r;
+
+    for (int k = 0; k < Nt; ++k) {
+
+        body_i.x = body_global[i].r[0];
+        body_i.y = body_global[i].r[1];
+        body_i.z = body_global[i].r[2];
+        body_i.w = body_global[i].m;
+
+        a_temp.x = 0; a_temp.y = 0; a_temp.z = 0;
+
+        for (int block = 0; block < N / block_size; ++block) {
+
+            const int shift = block * block_size;
+
+            body_shared[threadIdx.x].x = body_global[shift + threadIdx.x].r[0];
+            body_shared[threadIdx.x].y = body_global[shift + threadIdx.x].r[1];
+            body_shared[threadIdx.x].z = body_global[shift + threadIdx.x].r[2];
+            body_shared[threadIdx.x].w = body_global[shift + threadIdx.x].m;
+
+            __syncthreads();
+
+
+            for (size_t j = 0; j < block_size; ++j)
+            {
+                diff_r.x = body_i.x - body_shared[j].x;
+                diff_r.y = body_i.y - body_shared[j].y;
+                diff_r.z = body_i.z - body_shared[j].z;
+
+                coeff = 1.0 / max1(norm1(diff_r), eps);
+                coeff *= coeff * coeff;
+
+                a_temp.x -= coeff * G * body_shared[j].w * diff_r.x;
+                a_temp.y -= coeff * G * body_shared[j].w * diff_r.y;
+                a_temp.z -= coeff * G * body_shared[j].w * diff_r.z;
+            }
+
+            __syncthreads();
+        }
+
+        body_global_temp[i].x = body_global[i].r[0] + body_global[i].v[0] * tau;
+        body_global_temp[i].y = body_global[i].r[1] + body_global[i].v[1] * tau;
+        body_global_temp[i].z = body_global[i].r[2] + body_global[i].v[2] * tau;
+        body_global_temp[i].w = body_global[i].m;
+
+        v_temp.x = body_global[i].v[0] + a_temp.x * tau;
+        v_temp.y = body_global[i].v[1] + a_temp.y * tau;
+        v_temp.z = body_global[i].v[2] + a_temp.z * tau;
+
+       
+
+        const T2 body_i_temp = body_global_temp[i];
+
+        a.x = 0; a.y = 0; a.z = 0;
+
+        for (int block = 0; block < N / block_size; ++block) {
+
+            const int shift = block * block_size;
+
+            body_shared[threadIdx.x].x = body_global_temp[shift + threadIdx.x].x;
+            body_shared[threadIdx.x].y = body_global_temp[shift + threadIdx.x].y;
+            body_shared[threadIdx.x].z = body_global_temp[shift + threadIdx.x].z;
+            body_shared[threadIdx.x].w = body_global_temp[shift + threadIdx.x].w;
+
+            __syncthreads();
+
+            for (size_t j = 0; j < block_size; ++j)
+            {
+                diff_r.x = body_i_temp.x - body_shared[j].x;
+                diff_r.y = body_i_temp.y - body_shared[j].y;
+                diff_r.z = body_i_temp.z - body_shared[j].z;
+
+                coeff = 1.0 / max1(norm1(diff_r), eps);
+                coeff *= coeff * coeff;
+
+                a.x -= coeff * G * body_shared[j].w * diff_r.x;
+                a.y -= coeff * G * body_shared[j].w * diff_r.y;
+                a.z -= coeff * G * body_shared[j].w * diff_r.z;
+            }
+            __syncthreads();
+        }
+
+        body_global[i].r[0] += (body_global[i].v[0] + v_temp.x) * tau * 0.5;
+        body_global[i].r[1] += (body_global[i].v[1] + v_temp.y) * tau * 0.5;
+        body_global[i].r[2] += (body_global[i].v[2] + v_temp.z) * tau * 0.5;
+
+        body_global[i].v[0] += (a.x + a_temp.x) * tau * 0.5;
+        body_global[i].v[1] += (a.y + a_temp.y) * tau * 0.5;
+        body_global[i].v[2] += (a.z + a_temp.z) * tau * 0.5;
+
+        __syncthreads();
+    }
+}
+
+void runge_kutta(const int N, std::vector<Body> body_global, const int Nt, const double tau, const double tau_f) {
+
+    Body* body_global_device;
+    T2* body_temp_device;
+
+  //  cudaMalloc(&body_global_device, N * sizeof(Body));
+  //  cudaMalloc(&body_temp_device, N * sizeof(T2));
+  //  cudaMemcpy(body_global_device, body_global.data(), N * sizeof(Body), cudaMemcpyHostToDevice);
+
+    cudaError_t err;
+
+    err = cudaMalloc(&body_global_device, N * sizeof(Body));
+    if (err != cudaSuccess) printf("MALLOC ERROR %d %s\n", err, cudaGetErrorString(err));
+
+    err = cudaMemcpy(body_global_device, body_global.data(), N * sizeof(Body), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) printf("MEMCPY ERROR %d %s\n", err, cudaGetErrorString(err));
+
+    err = cudaMalloc(&body_temp_device, N * sizeof(T2));
+    if (err != cudaSuccess) printf("TEMP MALLOC ERROR %d %s\n", err, cudaGetErrorString(err));
+
+    int n_f = round(tau_f / tau); //интервал шагов, через которые происходит запись 
+
+    int blocks = N / BLOCK_SIZE;
+
+    std::vector<std::ofstream> F;
+    if (f2) {
+
+        F.resize(N);
+        for (size_t i = 0; i < N; ++i)
+        {
+            F[i].open("traj" + std::to_string(i+1) + ".txt");
+            F[i] << 0.0 << " " << body_global[i];
+        }
+
+        for (int m = n_f; m <= Nt; m+=n_f) {
+
+
+            runge_kutta_it << <blocks, BLOCK_SIZE >> > (body_global_device, body_temp_device, N, tau, n_f);
+            cudaDeviceSynchronize();
+
+            cudaMemcpy(body_global.data(), body_global_device, N * sizeof(Body), cudaMemcpyDeviceToHost);
+
+            for (size_t i = 0; i < N; ++i) {
+                F[i] << m * tau << " " << body_global[i];
+            }
+
+        }
+        
+    }
+    if (f2)
+        for (size_t i = 0; i < N; ++i)
+            F[i].close();
+    else {
+        runge_kutta_it << <blocks, BLOCK_SIZE >> > (body_global_device, body_temp_device, N, tau, Nt);
+        cudaMemcpy(body_global.data(), body_global_device, N * sizeof(Body), cudaMemcpyDeviceToHost);
+    }
+
+}
+
+void read_file(const std::string& file_name, std::vector<Body>& Body, int& N)
+{
+    std::ifstream f(file_name);
+
+    f >> N;
+    Body.resize(N);
+    for (int i = 0; i < N; i++)
+    {
+        f >> Body[i].m;
+        for (int k = 0; k < 3; k++) f >> Body[i].r[k];
+        for (int k = 0; k < 3; k++) f >> Body[i].v[k];
+    }
+    f.close();
+}
+
+double rand_R(double a, double b) {
+
+    srand(time(NULL));
+    return (double)((b - a) * rand()) / RAND_MAX + a;
+}
+
+void random_body(std::vector<Body>& Body, const int N) {
+
+    Body.resize(N);
+    for (size_t i = 0; i < N; ++i) {
+
+        Body[i].m = rand_R(1e5, 1e8);
+
+        for (size_t k = 0; k < 3; ++k) {
+            Body[i].r[k] = rand_R(-1e4, 1e4);
+            Body[i].v[k] = rand_R(-200, 200);
+        }
+    }
+
+}
+
+int main(int argc, char** argv)
+{
+    int N = 4;
+    double T = 20;
+    int Nt = 400;
+
+    double tau = T / Nt;
+    double tau_f = 0.1; //шаг записи в файл
+
+    std::vector<Body> Body_global; // создание локального массива тел
+
+
+    if (f1)
+        read_file("4body.txt", Body_global, N);
+    else
+        random_body(Body_global, N);
+
+    runge_kutta(N, Body_global, Nt, tau, tau_f);
+
+    return 0;
+}
